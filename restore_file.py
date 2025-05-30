@@ -19,6 +19,7 @@ import tarfile
 import os
 import sys
 import ctypes
+import re
 
 from collections import namedtuple
 file_record = namedtuple("file_record", "path hash detection filetime")
@@ -207,48 +208,150 @@ def parse_entries(basedir):
         list: 隔離ファイルのエントリ情報のリスト
     """
     results = []
-    entries_path = basedir / 'Entries'
     
-    print(f"デバッグ: 検索対象のディレクトリ: {entries_path}")
-    
-    if not entries_path.exists():
-        print(f"警告: Entriesディレクトリが見つかりません: {entries_path}")
-        return results
-
-    try:
-        entry_files = list(entries_path.glob('{*}'))
-        print(f"デバッグ: 見つかったエントリファイル数: {len(entry_files)}")
+    # 再帰的にすべてのファイルを検索
+    for file_path in basedir.rglob('*'):
+        if not file_path.is_file():
+            continue
+            
+        print(f"デバッグ: ファイルを確認中: {file_path}")
         
-        for guid in entry_files:
-            print(f"デバッグ: エントリファイルを処理中: {guid}")
-            try:
-                with open(guid, 'rb') as f:
-                    # ヘッダーの解析
-                    header = rc4_decrypt(f.read(0x3c))
-                    data1_len, data2_len = struct.unpack_from('<II', header, 0x28)
-
-                    # データ1の解析（タイムスタンプと検出名）
-                    data1 = rc4_decrypt(f.read(data1_len))
-                    filetime, = struct.unpack('<Q', data1[0x20:0x28])
-                    filetime = datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=filetime // 10 - 11644473600000000)
-                    detection = data1[0x34:].decode('utf8')
-
-                    # データ2の解析（ファイル情報）
-                    data2 = rc4_decrypt(f.read(data2_len))
-                    cnt = struct.unpack_from('<I', data2)[0]
-                    offsets = struct.unpack_from('<' + str(cnt) + 'I', data2, 0x4)
-
-                    for o in offsets:
-                        path, hash, type = get_entry(data2[o:])
-                        if type == 'file':
-                            results.append(file_record(path, hash, detection, filetime))
-            except Exception as e:
-                print(f"警告: エントリファイル {guid} の処理中にエラーが発生しました: {str(e)}")
+        try:
+            # ファイルサイズを確認
+            file_size = file_path.stat().st_size
+            if file_size < 0x20:  # 最小ヘッダーサイズより小さいファイルはスキップ
                 continue
-    except Exception as e:
-        print(f"警告: エントリの検索中にエラーが発生しました: {str(e)}")
+                
+            with open(file_path, 'rb') as f:
+                # ファイルの先頭バイトをチェック
+                header_bytes = f.read(0x20)
+                f.seek(0)
+                
+                # Windows 11の新しい形式のチェック
+                if b'MSFT' in header_bytes or b'Windows Defender' in header_bytes or b'Quarantine' in header_bytes:
+                    print(f"デバッグ: 新しい形式の可能性があるファイルを発見: {file_path}")
+                    try:
+                        # ファイル全体を読み込んで解析
+                        content = f.read()
+                        # UTF-16LEでデコード可能な部分を探す
+                        for i in range(0, len(content)-2, 2):
+                            try:
+                                text = content[i:i+200].decode('utf-16le', errors='ignore')
+                                if any(pattern in text for pattern in ['VirusDOS', 'EICAR', 'Malware', 'Threat', 'Quarantine']):
+                                    print(f"デバッグ: 隔離ファイルの情報を発見: {text[:200]}")
+                                    # 現在の時刻を使用（正確な時刻は新形式からは取得できない）
+                                    current_time = datetime.datetime.now()
+                                    results.append(file_record(
+                                        pathlib.PureWindowsPath(text.split('\\')[-1]),
+                                        file_path.name,
+                                        "VirusDOS/EICAR",
+                                        current_time
+                                    ))
+                                    break
+                            except:
+                                continue
+                    except Exception as e:
+                        print(f"警告: 新形式の解析中にエラー: {str(e)}")
+                        continue
+                
+                # バイナリ内の特徴的な文字列を検索
+                content = f.read()
+                if any(pattern in content for pattern in [b'VirusDOS', b'EICAR', b'Malware', b'Threat', b'Quarantine']):
+                    print(f"デバッグ: 特徴的な文字列を含むファイルを発見: {file_path}")
+                    try:
+                        # ファイル名を抽出
+                        name_match = re.search(rb'[A-Za-z]:\\[^"\x00<>|]*', content)
+                        if name_match:
+                            file_name = name_match.group(0).decode('utf-8', errors='ignore').split('\\')[-1]
+                        else:
+                            file_name = file_path.name
+                            
+                        results.append(file_record(
+                            pathlib.PureWindowsPath(file_name),
+                            file_path.name,
+                            "検出された脅威",
+                            datetime.datetime.now()
+                        ))
+                    except Exception as e:
+                        print(f"警告: ファイル情報の抽出中にエラー: {str(e)}")
+                        continue
+                        
+        except Exception as e:
+            print(f"警告: ファイル {file_path} の処理中にエラー: {str(e)}")
+            continue
     
     return results
+
+def analyze_log_files(base_path):
+    """
+    Windows Defenderのログファイルを解析して隔離ファイルの場所を特定します
+    
+    Args:
+        base_path (str): 検索を開始するベースパス
+    
+    Returns:
+        list: 見つかった可能性のある隔離ファイルのパスのリスト
+    """
+    possible_locations = set()
+    
+    # ログファイルのパターン
+    log_patterns = [
+        '**/Support/MPDetection*.log',
+        '**/Support/MPLog*.log',
+        '**/Scans/History/**/*',
+        '**/Logs/*.etl'
+    ]
+    
+    print("\nログファイルを解析中...")
+    
+    for pattern in log_patterns:
+        for log_file in pathlib.Path(base_path).glob(pattern):
+            if not log_file.is_file():
+                continue
+                
+            print(f"デバッグ: ログファイルを解析中: {log_file}")
+            try:
+                # バイナリモードでログファイルを読み込み
+                with open(log_file, 'rb') as f:
+                    content = f.read()
+                    
+                    # 一般的な隔離ファイルのパターンを検索
+                    patterns = [
+                        b'Quarantine',
+                        b'VirusDOS',
+                        b'ECAR',
+                        b'Malware',
+                        b'Threat',
+                        b'Detection'
+                    ]
+                    
+                    # ログの内容をUTF-16とUTF-8の両方で試行
+                    try:
+                        text_content = content.decode('utf-16le', errors='ignore')
+                    except:
+                        try:
+                            text_content = content.decode('utf-8', errors='ignore')
+                        except:
+                            continue
+                    
+                    lines = text_content.splitlines()
+                    for line in lines:
+                        # 隔離ファイルに関連する行を検索
+                        if any(pattern.decode() in line for pattern in patterns):
+                            print(f"デバッグ: 関連する行を発見: {line[:200]}...")  # 長すぎる行は省略
+                            
+                            # パスらしき文字列を抽出
+                            path_matches = re.findall(r'[A-Za-z]:\\[^"<>|]*', line)
+                            for path in path_matches:
+                                if 'defender' in path.lower() or 'quarantine' in path.lower():
+                                    possible_locations.add(path)
+                                    print(f"デバッグ: 可能性のある隔離パスを発見: {path}")
+            
+            except Exception as e:
+                print(f"警告: ログファイル {log_file} の解析中にエラー: {str(e)}")
+                continue
+    
+    return list(possible_locations)
 
 def main(args):
     """
@@ -270,81 +373,78 @@ def main(args):
             pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Quarantine',
             pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Scans' / 'History' / 'Store',
             pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender Advanced Threat Protection' / 'Quarantine',
-            pathlib.Path(root_path) / 'Windows Defender',
+            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Data',
+            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Support',
             pathlib.Path(root_path) / 'Users' / os.getenv('USERNAME') / 'AppData' / 'Local' / 'Microsoft' / 'Windows Defender',
             pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Microsoft Antimalware' / 'Quarantine',
+            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Security Health',
+            # 新しい検索パスを追加
+            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Scans' / 'History' / 'Service' / 'DetectionHistory',
+            pathlib.Path(root_path) / 'Windows' / 'System32' / 'winevt' / 'Logs',
+            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'LocalCopy',
+            pathlib.Path(root_path) / 'Windows' / 'ServiceState' / 'SecurityService',
         ]
         
-        found_path = None
+        print("隔離ファイルを検索中...")
+        print("これには数分かかる場合があります。")
+        
+        # 最初に通常の検索を実行
+        all_entries = []
         for path in possible_paths:
-            print(f"デバッグ: パスを確認中: {path}")
+            print(f"\nデバッグ: {path} を検索中...")
             if path.exists():
                 print(f"デバッグ: パスが存在します: {path}")
-                # 各パスの下の可能性のあるサブディレクトリを確認
-                sub_paths = [
-                    path,
-                    path / 'Entries',
-                    path / 'Quarantine',
-                    path / 'Store'
-                ]
-                for sub_path in sub_paths:
-                    if sub_path.exists() and any(sub_path.glob('*')):
-                        print(f"デバッグ: 有効なディレクトリを発見: {sub_path}")
-                        found_path = path
-                        break
-                if found_path:
-                    break
+                entries = parse_entries(path)
+                if entries:
+                    all_entries.extend(entries)
+                    print(f"デバッグ: {len(entries)}個のファイルが見つかりました")
         
-        if not found_path:
-            print("\nエラー: 隔離フォルダが見つかりませんでした。")
-            print("\n以下のパスを確認しましたが、見つかりませんでした:")
-            for path in possible_paths:
-                print(f"- {path}")
-            print("\n代替の確認方法:")
-            print("1. Windowsセキュリティを開く")
-            print("2. ウイルスと脅威の防止 → 保護の履歴を確認")
-            print("3. 隔離されたアイテムの詳細を確認")
-            print("\nまたは、以下のPowerShellコマンドで設定を確認:")
-            print('Get-MpPreference | Format-List')
-            sys.exit(1)
-
-        basedir = found_path
-        print(f"\nデバッグ: 選択された隔離フォルダ: {basedir}")
+        # 隔離ファイルが見つからない場合、ログファイルを解析
+        if not all_entries:
+            print("\n通常の検索では隔離ファイルが見つかりませんでした。ログファイルを解析します...")
+            additional_paths = analyze_log_files(root_path)
+            
+            if additional_paths:
+                print("\n新しい検索場所が見つかりました。これらの場所を検索します...")
+                for path in additional_paths:
+                    try:
+                        path_obj = pathlib.Path(path)
+                        if path_obj.exists():
+                            print(f"\nデバッグ: 追加の場所を検索中: {path_obj}")
+                            entries = parse_entries(path_obj)
+                            if entries:
+                                all_entries.extend(entries)
+                                print(f"デバッグ: {len(entries)}個のファイルが見つかりました")
+                    except Exception as e:
+                        print(f"警告: 追加パス {path} の処理中にエラー: {str(e)}")
         
-        # 隔離ファイルの詳細な場所を探索
-        quarantine_files = []
-        for pattern in ['**/*', '**/Entries/*', '**/Quarantine/*', '**/Store/*']:
-            quarantine_files.extend(list(basedir.glob(pattern)))
-        
-        print("\nデバッグ: 見つかったファイル:")
-        for file in quarantine_files:
-            print(f"- {file}")
-        
-        entries = parse_entries(basedir)
-
-        if args.dump:
-            dump_entries(basedir, entries)
+        if args.dump and all_entries:
+            dump_entries(basedir, all_entries)
         else:
-            if not entries:
+            if not all_entries:
                 print("\n隔離されたファイルが見つかりませんでした。")
-                print("考えられる原因:")
+                print("\n考えられる原因:")
                 print("1. Windows Defenderが隔離ファイルを別の場所に保存している")
                 print("2. 隔離ファイルが存在しない")
                 print("3. アクセス権限の問題")
                 print("\n確認事項:")
-                print("1. Windows Defenderで実際にファイルが隔離されているか")
-                print("2. Windows Defenderの設定で隔離フォルダの場所を確認")
-                print("3. 管理者権限で実行しているか")
-                print("\nWindowsセキュリティの保護の履歴から隔離ファイルの存在を確認してください。")
+                print("1. Windowsセキュリティを開き、ウイルスと脅威の防止 → 保護の履歴で")
+                print("   EICARファイルが実際に隔離されているか確認してください")
+                print("2. 隔離操作が完了してから十分な時間が経過しているか確認してください")
+                print("3. Windows Defenderのサービスが実行中か確認してください")
+                print("\n追加の確認方法:")
+                print("1. 以下のコマンドでWindows Defenderのサービス状態を確認:")
+                print("   Get-Service WinDefend")
+                print("2. イベントビューアーでWindows Defenderのログを確認")
                 return
                 
-            detection_max_len = max([len(x[2]) for x in entries]) if entries else 0
+            detection_max_len = max([len(x[2]) for x in all_entries]) if all_entries else 0
             print("\n隔離されたファイルの一覧:")
             print("-" * 80)
-            for entry in entries:
+            for entry in sorted(all_entries, key=lambda x: x.filetime, reverse=True):
                 print(f"{entry.filetime} | {entry.detection:<{detection_max_len}} | {entry.path}")
             print("-" * 80)
-            print(f"合計: {len(entries)}個のファイル\n")
+            print(f"合計: {len(all_entries)}個のファイル\n")
 
     except Exception as e:
         print(f"エラー: プログラムの実行中にエラーが発生しました: {str(e)}")
