@@ -20,6 +20,10 @@ import os
 import sys
 import ctypes
 import re
+import win32security
+import win32api
+import win32con
+import pywintypes
 
 from collections import namedtuple
 file_record = namedtuple("file_record", "path hash detection filetime")
@@ -197,6 +201,57 @@ def get_entry(data):
 
     return (path, hash, type)
 
+def enable_security_privilege():
+    """
+    セキュリティ関連の特権を有効にします
+    
+    Returns:
+        bool: 特権の有効化に成功した場合はTrue、失敗した場合はFalse
+    """
+    try:
+        # プロセスのトークンを取得
+        flags = win32security.TOKEN_ADJUST_PRIVILEGES | win32security.TOKEN_QUERY
+        token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), flags)
+        
+        # SEBackupPrivilege（バックアップ）とSESecurityPrivilege（セキュリティ）の特権を有効化
+        privileges = [
+            (win32security.LookupPrivilegeValue(None, "SeBackupPrivilege"), win32con.SE_PRIVILEGE_ENABLED),
+            (win32security.LookupPrivilegeValue(None, "SeSecurityPrivilege"), win32con.SE_PRIVILEGE_ENABLED)
+        ]
+        
+        # 特権を有効化
+        win32security.AdjustTokenPrivileges(token, False, privileges)
+        return True
+    except pywintypes.error as e:
+        print(f"警告: セキュリティ特権の有効化に失敗しました: {str(e)}")
+        return False
+
+def safe_open_file(file_path, mode='rb'):
+    """
+    安全にファイルを開くためのラッパー関数
+    
+    Args:
+        file_path: 開くファイルのパス
+        mode: ファイルを開くモード（デフォルトは'rb'）
+        
+    Returns:
+        tuple: (ファイルオブジェクト, エラーメッセージ)
+        エラーの場合はファイルオブジェクトはNone
+    """
+    try:
+        # まず通常の方法で試みる
+        return open(file_path, mode), None
+    except PermissionError:
+        try:
+            # セキュリティ特権を有効化
+            if enable_security_privilege():
+                # 再度ファイルを開く
+                return open(file_path, mode), None
+        except Exception as e:
+            return None, f"ファイルアクセスエラー: {str(e)}"
+    except Exception as e:
+        return None, f"ファイルアクセスエラー: {str(e)}"
+
 def parse_entries(basedir):
     """
     隔離ファイルのエントリ情報を解析します
@@ -209,6 +264,9 @@ def parse_entries(basedir):
     """
     results = []
     
+    # セキュリティ特権を有効化
+    enable_security_privilege()
+    
     # 再帰的にすべてのファイルを検索
     for file_path in basedir.rglob('*'):
         if not file_path.is_file():
@@ -217,12 +275,21 @@ def parse_entries(basedir):
         print(f"デバッグ: ファイルを確認中: {file_path}")
         
         try:
-            # ファイルサイズを確認
-            file_size = file_path.stat().st_size
-            if file_size < 0x20:  # 最小ヘッダーサイズより小さいファイルはスキップ
+            # ファイルを安全に開く
+            f, error = safe_open_file(file_path)
+            if error:
+                print(f"警告: {file_path} - {error}")
                 continue
                 
-            with open(file_path, 'rb') as f:
+            if not f:
+                continue
+                
+            with f:
+                # ファイルサイズを確認
+                file_size = file_path.stat().st_size
+                if file_size < 0x20:  # 最小ヘッダーサイズより小さいファイルはスキップ
+                    continue
+                    
                 # ファイルの先頭バイトをチェック
                 header_bytes = f.read(0x20)
                 f.seek(0)
