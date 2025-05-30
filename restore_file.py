@@ -420,6 +420,72 @@ def analyze_log_files(base_path):
     
     return list(possible_locations)
 
+def get_original_filename(hash_value):
+    """
+    ハッシュ値から元のファイル名を取得します
+    
+    Args:
+        hash_value (str): ファイルのハッシュ値
+        
+    Returns:
+        str: 元のファイル名、見つからない場合はNone
+    """
+    try:
+        # 検索するパス
+        detection_paths = [
+            pathlib.Path("C:/ProgramData/Microsoft/Windows Defender/Scans/History/Service/DetectionHistory"),
+            pathlib.Path("C:/ProgramData/Microsoft/Windows Defender/Scans/History/Service"),
+            pathlib.Path("C:/ProgramData/Microsoft/Windows Defender/Support")
+        ]
+        
+        # ファイルパターン
+        patterns = [
+            "*.log",
+            "Detections.log",
+            "MPDetection*.log"
+        ]
+        
+        for base_path in detection_paths:
+            if not base_path.exists():
+                continue
+                
+            # 再帰的にログファイルを検索
+            for pattern in patterns:
+                for log_file in base_path.rglob(pattern):
+                    try:
+                        f, error = safe_open_file(log_file)
+                        if error or not f:
+                            continue
+                            
+                        with f:
+                            content = f.read()
+                            # バイナリデータをデコード
+                            try:
+                                text = content.decode('utf-16le', errors='ignore')
+                            except:
+                                try:
+                                    text = content.decode('utf-8', errors='ignore')
+                                except:
+                                    continue
+                            
+                            # ハッシュ値を含む行を検索
+                            if hash_value in text:
+                                # ファイルパスを抽出
+                                matches = re.finditer(r'[A-Za-z]:\\[^"\n<>|]*', text)
+                                for match in matches:
+                                    path = match.group(0)
+                                    if path.endswith('.exe') or path.endswith('.dll') or path.endswith('.zip'):
+                                        return pathlib.PureWindowsPath(path).name
+                                        
+                    except Exception as e:
+                        print(f"警告: ログファイル {log_file} の解析中にエラー: {str(e)}")
+                        continue
+    
+    except Exception as e:
+        print(f"警告: 元のファイル名の検索中にエラー: {str(e)}")
+    
+    return None
+
 def main(args):
     """
     メイン処理を実行します
@@ -455,7 +521,6 @@ def main(args):
         print("隔離ファイルを検索中...")
         print("これには数分かかる場合があります。")
         
-        # 最初に通常の検索を実行
         all_entries = []
         for path in possible_paths:
             print(f"\nデバッグ: {path} を検索中...")
@@ -463,6 +528,11 @@ def main(args):
                 print(f"デバッグ: パスが存在します: {path}")
                 entries = parse_entries(path)
                 if entries:
+                    # 元のファイル名を取得
+                    for entry in entries:
+                        original_name = get_original_filename(entry.hash)
+                        if original_name:
+                            entry = entry._replace(path=pathlib.PureWindowsPath(original_name))
                     all_entries.extend(entries)
                     print(f"デバッグ: {len(entries)}個のファイルが見つかりました")
         
