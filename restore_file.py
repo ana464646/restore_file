@@ -15,7 +15,6 @@ import struct
 import argparse
 import datetime
 import pathlib
-import tarfile
 import os
 import sys
 import ctypes
@@ -24,8 +23,17 @@ import win32security
 import win32api
 import win32con
 import pywintypes
-
+import msvcrt
 from collections import namedtuple
+from winreg import *
+
+try:
+    from mpress import XpressDecompressor
+except ImportError:
+    print("mpressモジュールをインストールしています...")
+    os.system('pip install mpress')
+    from mpress import XpressDecompressor
+
 file_record = namedtuple("file_record", "path hash detection filetime")
 
 def is_admin():
@@ -486,6 +494,126 @@ def get_original_filename(hash_value):
     
     return None
 
+def get_defender_paths():
+    """
+    Windows Defenderの関連パスをレジストリから取得します
+    
+    Returns:
+        list: 検索対象のパスのリスト
+    """
+    paths = set()
+    try:
+        # レジストリキーを開く
+        with OpenKey(HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows Defender") as key:
+            try:
+                install_location = QueryValueEx(key, "InstallLocation")[0]
+                paths.add(pathlib.Path(install_location))
+            except:
+                pass
+            
+        with OpenKey(HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows Defender\Quarantine") as key:
+            try:
+                quarantine_location = QueryValueEx(key, "QuarantineLocation")[0]
+                paths.add(pathlib.Path(quarantine_location))
+            except:
+                pass
+    except:
+        pass
+        
+    # デフォルトのパスを追加
+    default_paths = [
+        pathlib.Path("C:/ProgramData/Microsoft/Windows Defender/Quarantine"),
+        pathlib.Path("C:/ProgramData/Microsoft/Windows Defender/Scans/History/Store"),
+        pathlib.Path("C:/ProgramData/Microsoft/Windows Defender/Scans/History/Service/DetectionHistory"),
+        pathlib.Path("C:/ProgramData/Microsoft/Windows Defender/Support"),
+        pathlib.Path("C:/ProgramData/Microsoft/Windows Defender/LocalCopy"),
+        pathlib.Path("C:/Windows/ServiceState/SecurityService")
+    ]
+    
+    paths.update(default_paths)
+    return list(paths)
+
+def find_quarantine_files():
+    """
+    システム内の隔離ファイルを検索します
+    
+    Returns:
+        list: 見つかった隔離ファイルのパスのリスト
+    """
+    quarantine_files = []
+    
+    # Windows Defenderの関連パスを取得
+    search_paths = get_defender_paths()
+    
+    for base_path in search_paths:
+        if not base_path.exists():
+            continue
+            
+        try:
+            # 再帰的にファイルを検索
+            for path in base_path.rglob("*"):
+                if not path.is_file():
+                    continue
+                    
+                try:
+                    # ファイルサイズチェック
+                    if path.stat().st_size < 0x20:
+                        continue
+                        
+                    # ファイルの先頭をチェック
+                    with open(path, "rb") as f:
+                        header = f.read(8)
+                        if (header.startswith(b"MPQU") or
+                            any(pattern in header for pattern in [b"MPSQ", b"MSFT", b"Windows Defender"])):
+                            quarantine_files.append(path)
+                except (PermissionError, OSError):
+                    continue
+                    
+        except Exception as e:
+            print(f"警告: {base_path}の検索中にエラー: {str(e)}")
+            
+    return quarantine_files
+
+def parse_quarantine_file(path):
+    """
+    隔離ファイルを解析して元のファイルを復元します
+    
+    Args:
+        path (str): 隔離ファイルのパス
+        
+    Returns:
+        bytes: 復元されたファイルデータ
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+
+        # ヘッダーチェック
+        if data[:4] == b"MPQU":
+            # 標準的な隔離ファイル形式
+            header_size = struct.unpack_from("<I", data, 4)[0]
+            if header_size >= len(data):
+                raise ValueError("無効なヘッダーサイズです")
+                
+            compressed = data[header_size:]
+            if not compressed:
+                raise ValueError("圧縮データが見つかりません")
+                
+            decompressor = XpressDecompressor()
+            decompressed = decompressor.decompress(compressed, output_size=10*len(compressed))
+            return decompressed
+            
+        else:
+            # 新しい形式の隔離ファイル
+            return rc4_decrypt(data)
+
+    except FileNotFoundError:
+        raise RuntimeError(f"ファイルが見つかりません: {path}")
+    except PermissionError:
+        raise RuntimeError(f"ファイルにアクセスする権限がありません: {path}")
+    except Exception as e:
+        raise RuntimeError(f"ファイルの解析中にエラーが発生しました: {str(e)}")
+
 def main(args):
     """
     メイン処理を実行します
@@ -495,97 +623,64 @@ def main(args):
     """
     if not is_admin():
         print("このプログラムは管理者権限で実行する必要があります。")
-        sys.exit(1)
+        if msvcrt.getch():  # キー入力待ち
+            sys.exit(1)
 
     try:
-        # Windowsのパス指定を修正
-        root_path = str(args.rootdir).rstrip('\\') + '\\'
-        
-        # Windows 11での一般的な隔離フォルダの場所をリストアップ
-        possible_paths = [
-            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Quarantine',
-            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Scans' / 'History' / 'Store',
-            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender Advanced Threat Protection' / 'Quarantine',
-            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Data',
-            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Support',
-            pathlib.Path(root_path) / 'Users' / os.getenv('USERNAME') / 'AppData' / 'Local' / 'Microsoft' / 'Windows Defender',
-            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Microsoft Antimalware' / 'Quarantine',
-            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Security Health',
-            # 新しい検索パスを追加
-            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Scans' / 'History' / 'Service' / 'DetectionHistory',
-            pathlib.Path(root_path) / 'Windows' / 'System32' / 'winevt' / 'Logs',
-            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'LocalCopy',
-            pathlib.Path(root_path) / 'Windows' / 'ServiceState' / 'SecurityService',
-        ]
-        
         print("隔離ファイルを検索中...")
         print("これには数分かかる場合があります。")
         
-        all_entries = []
-        for path in possible_paths:
-            print(f"\nデバッグ: {path} を検索中...")
-            if path.exists():
-                print(f"デバッグ: パスが存在します: {path}")
-                entries = parse_entries(path)
-                if entries:
-                    # 元のファイル名を取得
-                    for entry in entries:
-                        original_name = get_original_filename(entry.hash)
-                        if original_name:
-                            entry = entry._replace(path=pathlib.PureWindowsPath(original_name))
-                    all_entries.extend(entries)
-                    print(f"デバッグ: {len(entries)}個のファイルが見つかりました")
+        # 隔離ファイルの検索
+        quarantine_files = find_quarantine_files()
         
-        # 隔離ファイルが見つからない場合、ログファイルを解析
-        if not all_entries:
-            print("\n通常の検索では隔離ファイルが見つかりませんでした。ログファイルを解析します...")
-            additional_paths = analyze_log_files(root_path)
-            
-            if additional_paths:
-                print("\n新しい検索場所が見つかりました。これらの場所を検索します...")
-                for path in additional_paths:
-                    try:
-                        path_obj = pathlib.Path(path)
-                        if path_obj.exists():
-                            print(f"\nデバッグ: 追加の場所を検索中: {path_obj}")
-                            entries = parse_entries(path_obj)
-                            if entries:
-                                all_entries.extend(entries)
-                                print(f"デバッグ: {len(entries)}個のファイルが見つかりました")
-                    except Exception as e:
-                        print(f"警告: 追加パス {path} の処理中にエラー: {str(e)}")
-        
-        if args.dump and all_entries:
-            dump_entries(basedir, all_entries)
-        else:
-            if not all_entries:
-                print("\n隔離されたファイルが見つかりませんでした。")
-                print("\n考えられる原因:")
-                print("1. Windows Defenderが隔離ファイルを別の場所に保存している")
-                print("2. 隔離ファイルが存在しない")
-                print("3. アクセス権限の問題")
-                print("\n確認事項:")
-                print("1. Windowsセキュリティを開き、ウイルスと脅威の防止 → 保護の履歴で")
-                print("   EICARファイルが実際に隔離されているか確認してください")
-                print("2. 隔離操作が完了してから十分な時間が経過しているか確認してください")
-                print("3. Windows Defenderのサービスが実行中か確認してください")
-                print("\n追加の確認方法:")
-                print("1. 以下のコマンドでWindows Defenderのサービス状態を確認:")
-                print("   Get-Service WinDefend")
-                print("2. イベントビューアーでWindows Defenderのログを確認")
+        if not quarantine_files:
+            print("\n隔離ファイルが見つかりませんでした。")
+            print("\n考えられる原因:")
+            print("1. Windows Defenderが隔離ファイルを別の場所に保存している")
+            print("2. 隔離ファイルが存在しない")
+            print("3. アクセス権限の問題")
+            print("\n確認事項:")
+            print("1. Windowsセキュリティを開き、ウイルスと脅威の防止 → 保護の履歴で")
+            print("   ファイルが実際に隔離されているか確認してください")
+            print("2. 隔離操作が完了してから十分な時間が経過しているか確認してください")
+            print("3. Windows Defenderのサービスが実行中か確認してください")
+            if msvcrt.getch():  # キー入力待ち
                 return
-                
-            detection_max_len = max([len(x[2]) for x in all_entries]) if all_entries else 0
-            print("\n隔離されたファイルの一覧:")
-            print("-" * 80)
-            for entry in sorted(all_entries, key=lambda x: x.filetime, reverse=True):
-                print(f"{entry.filetime} | {entry.detection:<{detection_max_len}} | {entry.path}")
-            print("-" * 80)
-            print(f"合計: {len(all_entries)}個のファイル\n")
+        
+        print(f"\n{len(quarantine_files)}個の隔離ファイルが見つかりました")
+        
+        # 最新のファイルを処理
+        latest_file = max(quarantine_files, key=lambda f: f.stat().st_mtime)
+        print(f"\n処理するファイル: {latest_file}")
+        print(f"ファイルサイズ: {latest_file.stat().st_size:,} バイト")
+        print(f"最終更新日時: {datetime.datetime.fromtimestamp(latest_file.stat().st_mtime)}")
+
+        # 出力ディレクトリの作成
+        output_dir = pathlib.Path("restored_files")
+        output_dir.mkdir(exist_ok=True)
+
+        # 出力ファイル名の生成（タイムスタンプ付き）
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = output_dir / f"restored_{timestamp}_{latest_file.name}"
+
+        # ファイルの復元
+        print("\nファイルを復元中...")
+        restored_data = parse_quarantine_file(str(latest_file))
+        
+        # 復元したデータの保存
+        with open(output_path, "wb") as f:
+            f.write(restored_data)
+
+        print(f"\nファイルを復元しました: {output_path}")
+        print(f"復元したデータのサイズ: {len(restored_data):,} バイト")
+        
+        if msvcrt.getch():  # キー入力待ち
+            return
 
     except Exception as e:
         print(f"エラー: プログラムの実行中にエラーが発生しました: {str(e)}")
-        sys.exit(1)
+        if msvcrt.getch():  # キー入力待ち
+            sys.exit(1)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
