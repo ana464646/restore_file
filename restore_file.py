@@ -264,19 +264,62 @@ def main(args):
     try:
         # Windowsのパス指定を修正
         root_path = str(args.rootdir).rstrip('\\') + '\\'
-        basedir = pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Quarantine'
         
-        print(f"デバッグ: 検索対象のベースディレクトリ: {basedir}")
+        # Windows 11での一般的な隔離フォルダの場所をリストアップ
+        possible_paths = [
+            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Quarantine',
+            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Scans' / 'History' / 'Store',
+            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender Advanced Threat Protection' / 'Quarantine',
+            pathlib.Path(root_path) / 'Windows Defender',
+            pathlib.Path(root_path) / 'Users' / os.getenv('USERNAME') / 'AppData' / 'Local' / 'Microsoft' / 'Windows Defender',
+            pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Microsoft Antimalware' / 'Quarantine',
+        ]
         
-        if not basedir.exists():
-            print(f"エラー: 指定されたパスが見つかりません: {basedir}")
-            print("注意: 正しいパスは通常 'C:\\ProgramData\\Microsoft\\Windows Defender\\Quarantine' です。")
-            print("以下のディレクトリが存在するか確認してください:")
-            print("1. C:\\ProgramData")
-            print("2. C:\\ProgramData\\Microsoft")
-            print("3. C:\\ProgramData\\Microsoft\\Windows Defender")
+        found_path = None
+        for path in possible_paths:
+            print(f"デバッグ: パスを確認中: {path}")
+            if path.exists():
+                print(f"デバッグ: パスが存在します: {path}")
+                # 各パスの下の可能性のあるサブディレクトリを確認
+                sub_paths = [
+                    path,
+                    path / 'Entries',
+                    path / 'Quarantine',
+                    path / 'Store'
+                ]
+                for sub_path in sub_paths:
+                    if sub_path.exists() and any(sub_path.glob('*')):
+                        print(f"デバッグ: 有効なディレクトリを発見: {sub_path}")
+                        found_path = path
+                        break
+                if found_path:
+                    break
+        
+        if not found_path:
+            print("\nエラー: 隔離フォルダが見つかりませんでした。")
+            print("\n以下のパスを確認しましたが、見つかりませんでした:")
+            for path in possible_paths:
+                print(f"- {path}")
+            print("\n代替の確認方法:")
+            print("1. Windowsセキュリティを開く")
+            print("2. ウイルスと脅威の防止 → 保護の履歴を確認")
+            print("3. 隔離されたアイテムの詳細を確認")
+            print("\nまたは、以下のPowerShellコマンドで設定を確認:")
+            print('Get-MpPreference | Format-List')
             sys.exit(1)
 
+        basedir = found_path
+        print(f"\nデバッグ: 選択された隔離フォルダ: {basedir}")
+        
+        # 隔離ファイルの詳細な場所を探索
+        quarantine_files = []
+        for pattern in ['**/*', '**/Entries/*', '**/Quarantine/*', '**/Store/*']:
+            quarantine_files.extend(list(basedir.glob(pattern)))
+        
+        print("\nデバッグ: 見つかったファイル:")
+        for file in quarantine_files:
+            print(f"- {file}")
+        
         entries = parse_entries(basedir)
 
         if args.dump:
@@ -292,6 +335,7 @@ def main(args):
                 print("1. Windows Defenderで実際にファイルが隔離されているか")
                 print("2. Windows Defenderの設定で隔離フォルダの場所を確認")
                 print("3. 管理者権限で実行しているか")
+                print("\nWindowsセキュリティの保護の履歴から隔離ファイルの存在を確認してください。")
                 return
                 
             detection_max_len = max([len(x[2]) for x in entries]) if entries else 0
