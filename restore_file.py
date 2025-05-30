@@ -207,28 +207,47 @@ def parse_entries(basedir):
         list: 隔離ファイルのエントリ情報のリスト
     """
     results = []
-    for guid in basedir.glob('Entries/{*}'):
-        with open(guid, 'rb') as f:
-            # ヘッダーの解析
-            header = rc4_decrypt(f.read(0x3c))
-            data1_len, data2_len = struct.unpack_from('<II', header, 0x28)
+    entries_path = basedir / 'Entries'
+    
+    print(f"デバッグ: 検索対象のディレクトリ: {entries_path}")
+    
+    if not entries_path.exists():
+        print(f"警告: Entriesディレクトリが見つかりません: {entries_path}")
+        return results
 
-            # データ1の解析（タイムスタンプと検出名）
-            data1 = rc4_decrypt(f.read(data1_len))
-            filetime, = struct.unpack('<Q', data1[0x20:0x28])
-            filetime = datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=filetime // 10 - 11644473600000000)
-            detection = data1[0x34:].decode('utf8')
+    try:
+        entry_files = list(entries_path.glob('{*}'))
+        print(f"デバッグ: 見つかったエントリファイル数: {len(entry_files)}")
+        
+        for guid in entry_files:
+            print(f"デバッグ: エントリファイルを処理中: {guid}")
+            try:
+                with open(guid, 'rb') as f:
+                    # ヘッダーの解析
+                    header = rc4_decrypt(f.read(0x3c))
+                    data1_len, data2_len = struct.unpack_from('<II', header, 0x28)
 
-            # データ2の解析（ファイル情報）
-            data2 = rc4_decrypt(f.read(data2_len))
-            cnt = struct.unpack_from('<I', data2)[0]
-            offsets = struct.unpack_from('<' + str(cnt) + 'I', data2, 0x4)
+                    # データ1の解析（タイムスタンプと検出名）
+                    data1 = rc4_decrypt(f.read(data1_len))
+                    filetime, = struct.unpack('<Q', data1[0x20:0x28])
+                    filetime = datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=filetime // 10 - 11644473600000000)
+                    detection = data1[0x34:].decode('utf8')
 
-            for o in offsets:
-                path, hash, type = get_entry(data2[o:])
-                if type == 'file':
-                    results.append(file_record(path, hash, detection, filetime))
+                    # データ2の解析（ファイル情報）
+                    data2 = rc4_decrypt(f.read(data2_len))
+                    cnt = struct.unpack_from('<I', data2)[0]
+                    offsets = struct.unpack_from('<' + str(cnt) + 'I', data2, 0x4)
 
+                    for o in offsets:
+                        path, hash, type = get_entry(data2[o:])
+                        if type == 'file':
+                            results.append(file_record(path, hash, detection, filetime))
+            except Exception as e:
+                print(f"警告: エントリファイル {guid} の処理中にエラーが発生しました: {str(e)}")
+                continue
+    except Exception as e:
+        print(f"警告: エントリの検索中にエラーが発生しました: {str(e)}")
+    
     return results
 
 def main(args):
@@ -247,9 +266,15 @@ def main(args):
         root_path = str(args.rootdir).rstrip('\\') + '\\'
         basedir = pathlib.Path(root_path) / 'ProgramData' / 'Microsoft' / 'Windows Defender' / 'Quarantine'
         
+        print(f"デバッグ: 検索対象のベースディレクトリ: {basedir}")
+        
         if not basedir.exists():
             print(f"エラー: 指定されたパスが見つかりません: {basedir}")
             print("注意: 正しいパスは通常 'C:\\ProgramData\\Microsoft\\Windows Defender\\Quarantine' です。")
+            print("以下のディレクトリが存在するか確認してください:")
+            print("1. C:\\ProgramData")
+            print("2. C:\\ProgramData\\Microsoft")
+            print("3. C:\\ProgramData\\Microsoft\\Windows Defender")
             sys.exit(1)
 
         entries = parse_entries(basedir)
@@ -258,7 +283,15 @@ def main(args):
             dump_entries(basedir, entries)
         else:
             if not entries:
-                print("隔離されたファイルが見つかりませんでした。")
+                print("\n隔離されたファイルが見つかりませんでした。")
+                print("考えられる原因:")
+                print("1. Windows Defenderが隔離ファイルを別の場所に保存している")
+                print("2. 隔離ファイルが存在しない")
+                print("3. アクセス権限の問題")
+                print("\n確認事項:")
+                print("1. Windows Defenderで実際にファイルが隔離されているか")
+                print("2. Windows Defenderの設定で隔離フォルダの場所を確認")
+                print("3. 管理者権限で実行しているか")
                 return
                 
             detection_max_len = max([len(x[2]) for x in entries]) if entries else 0
